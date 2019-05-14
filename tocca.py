@@ -1,0 +1,340 @@
+
+from keras import backend as K
+from keras.models import Model
+from keras.layers import Input, Concatenate
+from keras.layers.core import Dense, Dropout
+from keras.regularizers import l2, Regularizer
+from keras.initializers import Zeros, Identity
+from keras.optimizers import Nadam
+from keras.layers.normalization import BatchNormalization
+from keras.engine import InputSpec, Layer
+from keras import initializers
+from tensorflow.linalg import tensor_diag_part, tensor_diag, eigh, inv
+import tensorflow as tf
+
+eps = 1e-12
+class ZCA(Layer):
+    """ZCA whitening layer."""
+
+    def __init__(self, momentum, r=1e-3, **kwargs):
+        super(ZCA,self).__init__(**kwargs)
+        self.momentum = K.cast_to_floatx(momentum)
+        if r == True:
+            r = 1e-3
+        self.r = K.cast_to_floatx(r)
+        self.count = 0
+        self.initialized = False
+        
+    def build(self, input_shape):
+        assert len(input_shape) >= 2
+        input_dim = input_shape[-1]
+
+        self.C = self.add_weight(shape=(input_dim,input_dim),
+                                 initializer=Zeros(),
+                                 name='C',
+                                 trainable=False)
+        #self.C = K.eye(input_dim)
+        self.U = self.add_weight(shape=(input_dim,input_dim),
+                                 initializer=Identity(),
+                                 name='U',
+                                 trainable=False)
+        self.input_spec = InputSpec(min_ndim=2, axes={-1: input_dim})
+        self.built = True
+
+    def call(self, X, training=None):
+
+        X0 = K.transpose( K.dot( self.U, K.transpose(X) ) )
+        if training in {0,False}:
+            return X0
+        
+        if True:#K.learning_phase():
+            #m = K.mean( X, axis=0, keepdims=True )
+            #X -= m
+
+            nd = K.shape(X)[1]
+            n = K.shape(X)[0]
+            C = K.dot( K.transpose(X), X ) / K.cast(n-1,'float32')
+            if not self.initialized:
+                self.C = 0.0 * self.C + C
+                self.initialized = True
+            else:
+                self.C = self.momentum * self.C + (1-self.momentum) * C
+            #self.C = C
+
+            self.count += 1
+
+            if True:#self.count == 1:
+                self.count = 0
+                
+                C = C + self.r * K.eye(K.shape(C)[0])#eye_like(C)
+
+                [D,V] = eigh(C)
+
+                # Added to increase stability
+                #posInd = tf.where( D > eps )
+                posInd = tf.where( K.greater(D, eps) )
+                #posInd = K.flatten( K.greater(D, eps) )
+                #posInd = ( K.greater(D, K.cast(eps,'float32')) )
+                #D = D[posInd]
+                #V = V[:, posInd]
+                #D = tf.boolean_mask(D,posInd)
+                #V = tf.boolean_mask(V,posInd,axis=1)
+                D = tf.gather(D,posInd)
+                V = tf.gather(V,posInd,axis=1)
+                #V = V.T
+
+                U = K.dot( K.dot( V, tensor_diag( inv( K.sqrt( D ) ) ) ), K.transpose(V) )
+                U = K.cast(U,'float32')
+            
+                self.add_update([(self.U,U)],X)
+
+                X_updated = K.transpose( K.dot( self.U, K.transpose(X) ) )
+
+        return K.in_train_phase(X_updated,X0,training=training)
+    
+class SDL(Regularizer):
+    """Stochastic decorrelation loss.  From Chang, 2018 paper"""
+
+    def __init__(self, d, momentum, C, l1=0., l2=0.):
+        self.d = d
+        self.momentum = momentum
+        self.C = C
+        self.l1 = K.cast_to_floatx(l1)
+        self.l2 = K.cast_to_floatx(l2)
+        self.denom = 0
+        self.initialized = False
+
+    def __call__(self, X):
+        #self.denom = self.alpha * self.denom + 1
+        Ci = K.dot( K.transpose(X), X ) / (K.cast(K.shape(X)[0],'float32')-1+1e-6)
+        #C = ( self.alpha * self.C + Ci ) / self.denom
+        if not self.initialized:
+            C = 0.0 * self.C + Ci
+            self.initialized = True
+        else:
+            C = self.momentum * self.C + (1-self.momentum) * Ci
+        reg = self.l1 * ( K.sum(K.sum(K.abs(C))) - K.sum(K.abs(tensor_diag_part(C))) ) + self.l2 * ( K.sum(K.sum( C**2 )) - K.sum(tensor_diag_part(C)**2) )
+        self.C = C
+        return reg
+
+    def get_config(self):
+        return {'d': int(self.d),
+                'momentum': float(self.momentum),
+                'l1': float(self.l1),
+                'l2': float(self.l2)}
+
+class StochasticDecorrelation(Layer):
+    """Layer for Stochastic decorrelation loss.  From Chang, 2018 paper"""
+
+    def __init__(self, d, momentum, l1=0., l2=0., **kwargs):
+        super(StochasticDecorrelation, self).__init__(**kwargs)
+        self.supports_masking = True
+        self.d = d
+        self.momentum = momentum
+        self.l1 = l1
+        self.l2 = l2
+        self.C = self.add_weight(shape=(d,d),
+                                 initializer=Zeros(),
+                                 name='C',
+                                 trainable=False,
+                                 constraint=None)
+        self.activity_regularizer = SDL(d=d, momentum=momentum, C=self.C, l1=l1, l2=l2)
+
+    def get_config(self):
+        config = {'d': self.d,
+                  'momentum': self.momentum,
+                  'l1': self.l1,
+                  'l2': self.l2}
+        base_config = super(StochasticDecorrelation, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+class BatchNorm(Layer):
+    """Batch normalization without extra weights."""
+
+    def __init__(self,
+                 axis=-1,
+                 momentum=0.99,
+                 epsilon=1e-6,
+                 moving_mean_initializer='zeros',
+                 moving_variance_initializer='ones',
+                 **kwargs):
+        super(BatchNorm, self).__init__(**kwargs)
+        self.supports_masking = True
+        self.axis = axis
+        self.momentum = momentum
+        self.epsilon = epsilon
+        self.moving_mean_initializer = initializers.get(moving_mean_initializer)
+        self.moving_variance_initializer = initializers.get(moving_variance_initializer)
+        self.initialized = False
+
+    def build(self, input_shape):
+        dim = input_shape[self.axis]
+        self.input_spec = InputSpec(ndim=len(input_shape),
+                                    axes={self.axis: dim})
+        shape = (dim,)
+        shape = tuple([1]*(len(input_shape)-1)+[input_shape[-1]])
+
+        self.moving_mean = self.add_weight(
+            shape=(dim,),#shape,
+            name='moving_mean',
+            initializer=self.moving_mean_initializer,
+            trainable=False)
+        self.moving_variance = self.add_weight(
+            shape=(dim,),#shape,
+            name='moving_variance',
+            initializer=self.moving_variance_initializer,
+            trainable=False)
+        self.built = True
+
+    def call(self, inputs, training=None):
+        input_shape = K.int_shape(inputs)
+
+        X0 = (inputs-self.moving_mean)/K.sqrt(self.moving_variance+self.epsilon)
+        if training in {0,False}:
+            return X0
+
+        if True:#K.learning_phase():
+            mean = K.mean( inputs, axis=0 )#, keepdims=True )
+            variance = K.var( inputs, axis=0 )#, keepdims=True )
+
+            if not self.initialized:
+                mean = 0.0 * self.moving_mean + mean
+                variance = 0.0 * self.moving_variance + variance
+                self.initialized = True
+            else:
+                mean = self.momentum * self.moving_mean + (1-self.momentum) * mean
+                variance = self.momentum * self.moving_variance + (1-self.momentum) * variance
+
+            self.add_update( [(self.moving_mean,mean),(self.moving_variance,variance)], inputs )
+
+            X_updated = (inputs-mean)/K.sqrt(variance+self.epsilon)
+
+            return K.in_train_phase(X_updated,X0,training=training)
+            #return X_updated
+        #else:
+        if True:
+            mean = self.moving_mean
+            variance = self.moving_variance
+            X0 = (inputs-mean)/K.sqrt(variance+self.epsilon)
+            #return X0
+        return K.in_train_phase(X_updated,X0)
+
+        if self.mean is None:
+            self.mean = mean
+            self.variance = variance
+
+        X0 = (inputs-self.mean)/K.sqrt(self.variance+self.epsilon)
+        self.mean = self.momentum * self.mean + (1-self.momentum) * mean
+        self.variance = self.momentum * self.variance + (1-self.momentum) * variance
+
+        return (inputs-self.mean)/K.sqrt(self.variance+self.epsilon)
+
+    def get_config(self):
+        config = {
+            'axis': self.axis,
+            'momentum': self.momentum,
+            'epsilon': self.epsilon,
+        }
+        base_config = super(BatchNorm, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+_EPSILON = 10e-8
+def categorical_crossentropy_missing(target, output):
+    # scale preds so that the class probas of each sample sum to 1
+    #output /= (output.sum(axis=1, keepdims=True)+_EPSILON)
+    output /= (K.sum(output, axis=1, keepdims=True)+_EPSILON)
+    # avoid numerical instability with _EPSILON clipping
+    output = K.clip(output, _EPSILON, 1.0 - _EPSILON)
+    # identify samples with label (should have 1 for one of the classes)
+    select = K.cast( K.greater(K.max(target,axis=1),0.5), 'float32' )
+    ce = -K.sum(target * K.log(output), axis=1)
+    # only sum across samples with label
+    return K.sum( ce * select ) / (K.sum(select)+_EPSILON)
+
+def l2dist( X, ncomp=None ):
+
+    #shape = X.get_shape().as_list()
+    shape = K.shape(X)
+    d = shape[1]//2
+    m = shape[0]
+    if ncomp is None:
+        H1 = X[:,:d]
+        H2 = X[:,d:]
+    else:
+        H1 = X[:,:ncomp]
+        H2 = X[:,d:d+ncomp]
+    H1bar = H1
+    H2bar = H2
+    
+    diff = H1bar - H2bar
+    return K.sum( K.sum( diff**2 ) ) / ( K.cast( K.shape(diff)[0], 'float32') )
+
+def create_model( model_type, nclasses, input_dims, layers, layer_size, shared_size, lr=1e-4, l2dist_weight=1.0, momentum=0.99, l2_weight=0, sd_weight=0, zca_r=1e-4, dropout=False ):
+
+    config = tf.ConfigProto()
+    config.gpu_options.per_process_gpu_memory_fraction = 0.1
+    K.tensorflow_backend.set_session(tf.Session(config=config))
+    
+    print('layer_size',layer_size)
+    if type(layer_size) is not list:
+        layer_size = [ [ layer_size for l in range(layers) ] for m in range(len(input_dims)) ]
+    elif type(layer_size[0]) is not list:
+        layer_size = [ [ ls for ls in range(layers) ] for ls in layer_size ]
+
+    # create individual layers
+    inputs = []
+    xindiv = []
+    for m,(dim,cur_layer_size) in enumerate(zip(input_dims,layer_size)):
+        x = Input(shape=(dim,))
+        inputs.append( x )
+
+        # dense layers
+        for layer,ls in enumerate(cur_layer_size):
+            x = Dense(ls, activation='relu', kernel_regularizer=l2(l2_weight), name='dense_'+str(m)+'_'+str(layer))(x)
+            if layer == len(cur_layer_size)-1:
+                x = BatchNorm(momentum=momentum)(x)
+                #x = BatchNormalization(momentum=momentum,scale=False)(x)
+            else:
+                x = BatchNormalization(momentum=momentum)(x)
+            if dropout is not None:
+                x = Dropout(dropout)(x)
+
+        # shared layer
+        kernel_reg = l2(l2_weight)
+        x = Dense(shared_size, use_bias=False, kernel_regularizer=kernel_reg, name='dense_'+str(m))(x)
+        x = BatchNorm(momentum=momentum)(x)
+        #x = BatchNormalization(momentum=momentum,scale=False)(x)
+        
+        # apply whitening or soft decorrelation
+        if model_type == 'w':
+            x = ZCA(momentum=momentum, r=zca_r, name='zca_'+str(m))(x)
+        elif model_type == 'sd':
+            x = StochasticDecorrelation( shared_size, momentum, l1=sd_weight )(x)
+
+        xindiv.append( x )
+
+    xmerge = Concatenate()(xindiv)
+
+    outputs = []
+    dense = Dense(nclasses, activation='softmax', kernel_regularizer=l2(l2_weight), name='softmax')
+    for m,x in enumerate(xindiv):
+        softmax = dense(x)
+        outputs.append( softmax )
+
+    losses = [categorical_crossentropy_missing]*len(outputs)
+    metrics = ['accuracy']
+
+    outputs.append( xmerge )
+    l2dist_loss = lambda y_true, y_pred: l2dist(y_pred,shared_size) * l2dist_weight
+    losses.append( l2dist_loss )
+
+    model = Model(inputs=inputs, outputs=outputs)
+
+    print(model.summary())
+
+    model.compile( optimizer=Nadam(lr=lr), loss=losses, metrics=metrics )
+
+    return model
