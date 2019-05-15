@@ -9,7 +9,8 @@ from keras.optimizers import Nadam
 from keras.layers.normalization import BatchNormalization
 from keras.engine import InputSpec, Layer
 from keras import initializers
-from tensorflow.linalg import tensor_diag_part, tensor_diag, eigh, inv
+from tensorflow.linalg import tensor_diag_part, tensor_diag, eigh
+from tensorflow.math import reciprocal
 import tensorflow as tf
 
 eps = 1e-12
@@ -22,7 +23,7 @@ class ZCA(Layer):
         if r == True:
             r = 1e-3
         self.r = K.cast_to_floatx(r)
-        self.count = 0
+        #self.count = 0
         self.initialized = False
         
     def build(self, input_shape):
@@ -47,48 +48,38 @@ class ZCA(Layer):
         if training in {0,False}:
             return X0
         
-        if True:#K.learning_phase():
-            #m = K.mean( X, axis=0, keepdims=True )
-            #X -= m
-
-            nd = K.shape(X)[1]
-            n = K.shape(X)[0]
-            C = K.dot( K.transpose(X), X ) / K.cast(n-1,'float32')
-            if not self.initialized:
-                self.C = 0.0 * self.C + C
-                self.initialized = True
-            else:
-                self.C = self.momentum * self.C + (1-self.momentum) * C
-            #self.C = C
-
-            self.count += 1
-
-            if True:#self.count == 1:
-                self.count = 0
+        nd = K.shape(X)[1]
+        n = K.shape(X)[0]
+        C = K.dot( K.transpose(X), X ) / K.cast(n-1,'float32')
+        if not self.initialized:
+            self.C = 0.0 * self.C + C
+            self.initialized = True
+        else:
+            self.C = self.momentum * self.C + (1-self.momentum) * C
                 
-                C = C + self.r * K.eye(K.shape(C)[0])#eye_like(C)
+        C = C + self.r * K.eye(K.shape(C)[0])#eye_like(C)
 
-                [D,V] = eigh(C)
+        [D,V] = eigh(C)
 
-                # Added to increase stability
-                #posInd = tf.where( D > eps )
-                posInd = tf.where( K.greater(D, eps) )
-                #posInd = K.flatten( K.greater(D, eps) )
-                #posInd = ( K.greater(D, K.cast(eps,'float32')) )
-                #D = D[posInd]
-                #V = V[:, posInd]
-                #D = tf.boolean_mask(D,posInd)
-                #V = tf.boolean_mask(V,posInd,axis=1)
-                D = tf.gather(D,posInd)
-                V = tf.gather(V,posInd,axis=1)
-                #V = V.T
+        # Added to increase stability
+        #posInd = tf.where( D > eps )
+        posInd = tf.where( K.greater(D, eps) )
+        #posInd = K.flatten( K.greater(D, eps) )
+        #posInd = ( K.greater(D, K.cast(eps,'float32')) )
+        #D = D[posInd]
+        #V = V[:, posInd]
+        #D = tf.boolean_mask(D,posInd)
+        #V = tf.boolean_mask(V,posInd,axis=1)
+#        D = tf.gather(D,posInd)
+#        V = tf.gather(V,posInd,axis=1)
+        #V = V.T
 
-                U = K.dot( K.dot( V, tensor_diag( inv( K.sqrt( D ) ) ) ), K.transpose(V) )
-                U = K.cast(U,'float32')
+        U = K.dot( K.dot( V, tensor_diag( reciprocal( K.sqrt( D ) ) ) ), K.transpose(V) )
+        #U = K.cast(U,'float32')
             
-                self.add_update([(self.U,U)],X)
+        self.add_update([(self.U,U)],X)
 
-                X_updated = K.transpose( K.dot( self.U, K.transpose(X) ) )
+        X_updated = K.transpose( K.dot( self.U, K.transpose(X) ) )
 
         return K.in_train_phase(X_updated,X0,training=training)
     

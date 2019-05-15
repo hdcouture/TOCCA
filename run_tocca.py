@@ -55,11 +55,13 @@ def train_test_model( X_train, y_train, X_val, y_val, X_test, y_test, model_type
     p_val = svm.predict( shared_val[1] )
     acc_val = ( y_val == p_val ).mean()
 
-    if np.isinf(X_test[0]).flatten().sum() > 0 or np.isinf(X_test[1]).flatten().sum() > 0:
-        print('************inf')
-        return 0,0,0
+    #if np.isinf(X_test[0]).flatten().sum() > 0 or np.isinf(X_test[1]).flatten().sum() > 0:
+    #    print('************inf')
+    #    return 0,0,0
     print(np.isnan(X_test[0]).flatten().sum())
     print(np.isnan(X_test[1]).flatten().sum())
+    print(np.isinf(X_test[0]).flatten().sum())
+    print(np.isinf(X_test[1]).flatten().sum())
     p_test = model.predict( X_test )
     shared_test = [ p_test[2][:,:shared_size], p_test[2][:,shared_size:] ]
     print(shared_test[1])
@@ -158,7 +160,7 @@ if __name__ == "__main__":
             else:
                 cv = int(cv)
 
-        params = { 'layers':[1,2,3,4], 'layer_size':[200], 'l2dist_weight':[1e-3,1e-2,1e-1,1e0,1e1,1e2,1e3], 'l2_weight':[1e-5,1e-4,1e-3,1e-2,1e-1,0], 'momentum':[0.99,0.95,0.9], 'learning_rate':[1e-2,1e-3,1e-4], 'batch_size':[100,1000] }
+        params = { 'layers':[1,2,3,4], 'layer_size':[200], 'l2dist_weight':[1e-3,1e-2,1e-1,1e0,1e1,1e2,1e3], 'l2_weight':[1e-5,1e-4,1e-3,1e-2,1e-1,0], 'momentum':[0.99,0.95,0.9], 'learning_rate':[1e-2,1e-3,1e-4], 'batch_size':[1000] }
         if model_type == 'sd':
             params.update( { 'sd_weight':[1e-5,1e-4,1e-3,1e-2,1e-1] } )
         elif model_type == 'w':
