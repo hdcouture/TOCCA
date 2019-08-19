@@ -9,9 +9,23 @@ from keras.optimizers import Nadam
 from keras.layers.normalization import BatchNormalization
 from keras.engine import InputSpec, Layer
 from keras import initializers
-from tensorflow.linalg import tensor_diag_part, tensor_diag, eigh
-from tensorflow.math import reciprocal
-import tensorflow as tf
+if 'theano' in dir(K):
+    BACKEND = 'theano'
+    from theano.tensor import diagonal as diag_part
+    from theano.tensor.nlinalg import diag, eigh
+    from theano.tensor import inv as reciprocal
+    from theano.tensor import where
+    from theano.tensor import identity_like as eye_like
+else:
+    BACKEND = 'tensorflow'
+    from tensorflow.linalg import tensor_diag_part as diag_part
+    from tensorflow.linalg import tensor_diag as diag
+    from tensorflow.linalg import eigh
+    from tensorflow.math import reciprocal
+    from tensorflow import where
+    import tensorflow as tf
+    def eye_like(C):
+        return K.eye(K.shape(C)[0])
 
 eps = 1e-12
 class ZCA(Layer):
@@ -23,7 +37,6 @@ class ZCA(Layer):
         if r == True:
             r = 1e-3
         self.r = K.cast_to_floatx(r)
-        #self.count = 0
         self.initialized = False
         
     def build(self, input_shape):
@@ -34,7 +47,6 @@ class ZCA(Layer):
                                  initializer=Zeros(),
                                  name='C',
                                  trainable=False)
-        #self.C = K.eye(input_dim)
         self.U = self.add_weight(shape=(input_dim,input_dim),
                                  initializer=Identity(),
                                  name='U',
@@ -44,7 +56,8 @@ class ZCA(Layer):
 
     def call(self, X, training=None):
 
-        X0 = K.transpose( K.dot( self.U, K.transpose(X) ) )
+        #X0 = K.transpose( K.dot( self.U, K.transpose(X) ) )
+        X0 = K.dot( X, self.U.transpose )
         if training in {0,False}:
             return X0
         
@@ -56,14 +69,14 @@ class ZCA(Layer):
             self.initialized = True
         else:
             self.C = self.momentum * self.C + (1-self.momentum) * C
-                
-        C = C + self.r * K.eye(K.shape(C)[0])#eye_like(C)
+
+        C = C + self.r * eye_like(C)
 
         [D,V] = eigh(C)
 
         # Added to increase stability
         #posInd = tf.where( D > eps )
-        posInd = tf.where( K.greater(D, eps) )
+#        posInd = where( K.greater(D, eps) )
         #posInd = K.flatten( K.greater(D, eps) )
         #posInd = ( K.greater(D, K.cast(eps,'float32')) )
         #D = D[posInd]
@@ -74,12 +87,13 @@ class ZCA(Layer):
 #        V = tf.gather(V,posInd,axis=1)
         #V = V.T
 
-        U = K.dot( K.dot( V, tensor_diag( reciprocal( K.sqrt( D ) ) ) ), K.transpose(V) )
-        #U = K.cast(U,'float32')
+        #U = K.dot( K.dot( V, diag( reciprocal( K.sqrt( D ) ) ) ), K.transpose(V) )
+        U = K.transpose( K.dot( K.dot( V, diag( reciprocal( K.sqrt( D ) ) ) ), K.transpose(V) ) )
             
         self.add_update([(self.U,U)],X)
 
-        X_updated = K.transpose( K.dot( self.U, K.transpose(X) ) )
+        #X_updated = K.transpose( K.dot( self.U, K.transpose(X) ) )
+        X_updated = K.dot( X, self.U )
 
         return K.in_train_phase(X_updated,X0,training=training)
     
@@ -96,15 +110,13 @@ class SDL(Regularizer):
         self.initialized = False
 
     def __call__(self, X):
-        #self.denom = self.alpha * self.denom + 1
         Ci = K.dot( K.transpose(X), X ) / (K.cast(K.shape(X)[0],'float32')-1+1e-6)
-        #C = ( self.alpha * self.C + Ci ) / self.denom
         if not self.initialized:
             C = 0.0 * self.C + Ci
             self.initialized = True
         else:
             C = self.momentum * self.C + (1-self.momentum) * Ci
-        reg = self.l1 * ( K.sum(K.sum(K.abs(C))) - K.sum(K.abs(tensor_diag_part(C))) ) + self.l2 * ( K.sum(K.sum( C**2 )) - K.sum(tensor_diag_part(C)**2) )
+        reg = self.l1 * ( K.sum(K.sum(K.abs(C))) - K.sum(K.abs(diag_part(C))) ) + self.l2 * ( K.sum(K.sum( C**2 )) - K.sum(diag_part(C)**2) )
         self.C = C
         return reg
 
@@ -140,7 +152,7 @@ class StochasticDecorrelation(Layer):
         return dict(list(base_config.items()) + list(config.items()))
 
 class BatchNorm(Layer):
-    """Batch normalization without extra weights."""
+    """Batch normalization without extra translation and scaling weights."""
 
     def __init__(self,
                  axis=-1,
@@ -166,12 +178,12 @@ class BatchNorm(Layer):
         shape = tuple([1]*(len(input_shape)-1)+[input_shape[-1]])
 
         self.moving_mean = self.add_weight(
-            shape=(dim,),#shape,
+            shape=(dim,),
             name='moving_mean',
             initializer=self.moving_mean_initializer,
             trainable=False)
         self.moving_variance = self.add_weight(
-            shape=(dim,),#shape,
+            shape=(dim,),
             name='moving_variance',
             initializer=self.moving_variance_initializer,
             trainable=False)
@@ -184,41 +196,22 @@ class BatchNorm(Layer):
         if training in {0,False}:
             return X0
 
-        if True:#K.learning_phase():
-            mean = K.mean( inputs, axis=0 )#, keepdims=True )
-            variance = K.var( inputs, axis=0 )#, keepdims=True )
+        mean = K.mean( inputs, axis=0 )#, keepdims=True )
+        variance = K.var( inputs, axis=0 )#, keepdims=True )
 
-            if not self.initialized:
-                mean = 0.0 * self.moving_mean + mean
-                variance = 0.0 * self.moving_variance + variance
-                self.initialized = True
-            else:
-                mean = self.momentum * self.moving_mean + (1-self.momentum) * mean
-                variance = self.momentum * self.moving_variance + (1-self.momentum) * variance
+        if not self.initialized:
+            mean = 0.0 * self.moving_mean + mean
+            variance = 0.0 * self.moving_variance + variance
+            self.initialized = True
+        else:
+            mean = self.momentum * self.moving_mean + (1-self.momentum) * mean
+            variance = self.momentum * self.moving_variance + (1-self.momentum) * variance
 
-            self.add_update( [(self.moving_mean,mean),(self.moving_variance,variance)], inputs )
+        self.add_update( [(self.moving_mean,mean),(self.moving_variance,variance)], inputs )
 
-            X_updated = (inputs-mean)/K.sqrt(variance+self.epsilon)
-
-            return K.in_train_phase(X_updated,X0,training=training)
-            #return X_updated
-        #else:
-        if True:
-            mean = self.moving_mean
-            variance = self.moving_variance
-            X0 = (inputs-mean)/K.sqrt(variance+self.epsilon)
-            #return X0
-        return K.in_train_phase(X_updated,X0)
-
-        if self.mean is None:
-            self.mean = mean
-            self.variance = variance
-
-        X0 = (inputs-self.mean)/K.sqrt(self.variance+self.epsilon)
-        self.mean = self.momentum * self.mean + (1-self.momentum) * mean
-        self.variance = self.momentum * self.variance + (1-self.momentum) * variance
-
-        return (inputs-self.mean)/K.sqrt(self.variance+self.epsilon)
+        X_updated = (inputs-mean)/K.sqrt(variance+self.epsilon)
+        
+        return K.in_train_phase(X_updated,X0,training=training)
 
     def get_config(self):
         config = {
@@ -234,8 +227,8 @@ class BatchNorm(Layer):
 
 _EPSILON = 10e-8
 def categorical_crossentropy_missing(target, output):
+    """Categorical crossentropy loss, but ignore any samples with no label"""
     # scale preds so that the class probas of each sample sum to 1
-    #output /= (output.sum(axis=1, keepdims=True)+_EPSILON)
     output /= (K.sum(output, axis=1, keepdims=True)+_EPSILON)
     # avoid numerical instability with _EPSILON clipping
     output = K.clip(output, _EPSILON, 1.0 - _EPSILON)
@@ -246,8 +239,8 @@ def categorical_crossentropy_missing(target, output):
     return K.sum( ce * select ) / (K.sum(select)+_EPSILON)
 
 def l2dist( X, ncomp=None ):
+    """Squared Frobenius matrix norm of distance between two modalities (left and right half of X)."""
 
-    #shape = X.get_shape().as_list()
     shape = K.shape(X)
     d = shape[1]//2
     m = shape[0]
@@ -264,12 +257,13 @@ def l2dist( X, ncomp=None ):
     return K.sum( K.sum( diff**2 ) ) / ( K.cast( K.shape(diff)[0], 'float32') )
 
 def create_model( model_type, nclasses, input_dims, layers, layer_size, shared_size, lr=1e-4, l2dist_weight=1.0, momentum=0.99, l2_weight=0, sd_weight=0, zca_r=1e-4, dropout=False ):
+    """Create deep TOCCA model."""
 
-    config = tf.ConfigProto()
-    config.gpu_options.per_process_gpu_memory_fraction = 0.1
-    K.tensorflow_backend.set_session(tf.Session(config=config))
+    if BACKEND == 'tensorflow':
+        config = tf.ConfigProto()
+        config.gpu_options.per_process_gpu_memory_fraction = 0.1
+        K.tensorflow_backend.set_session(tf.Session(config=config))
     
-    print('layer_size',layer_size)
     if type(layer_size) is not list:
         layer_size = [ [ layer_size for l in range(layers) ] for m in range(len(input_dims)) ]
     elif type(layer_size[0]) is not list:
@@ -285,11 +279,7 @@ def create_model( model_type, nclasses, input_dims, layers, layer_size, shared_s
         # dense layers
         for layer,ls in enumerate(cur_layer_size):
             x = Dense(ls, activation='relu', kernel_regularizer=l2(l2_weight), name='dense_'+str(m)+'_'+str(layer))(x)
-            if layer == len(cur_layer_size)-1:
-                x = BatchNorm(momentum=momentum)(x)
-                #x = BatchNormalization(momentum=momentum,scale=False)(x)
-            else:
-                x = BatchNormalization(momentum=momentum)(x)
+            x = BatchNormalization(momentum=momentum)(x)
             if dropout is not None:
                 x = Dropout(dropout)(x)
 
@@ -297,7 +287,6 @@ def create_model( model_type, nclasses, input_dims, layers, layer_size, shared_s
         kernel_reg = l2(l2_weight)
         x = Dense(shared_size, use_bias=False, kernel_regularizer=kernel_reg, name='dense_'+str(m))(x)
         x = BatchNorm(momentum=momentum)(x)
-        #x = BatchNormalization(momentum=momentum,scale=False)(x)
         
         # apply whitening or soft decorrelation
         if model_type == 'w':
@@ -309,6 +298,7 @@ def create_model( model_type, nclasses, input_dims, layers, layer_size, shared_s
 
     xmerge = Concatenate()(xindiv)
 
+    # softmax output, shared across modalities
     outputs = []
     dense = Dense(nclasses, activation='softmax', kernel_regularizer=l2(l2_weight), name='softmax')
     for m,x in enumerate(xindiv):
