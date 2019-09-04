@@ -14,7 +14,7 @@ if 'theano' in dir(K):
     from theano.tensor import diagonal as diag_part
     from theano.tensor.nlinalg import diag, eigh
     from theano.tensor import inv as reciprocal
-    from theano.tensor import where
+    from theano.tensor import nonzero
     from theano.tensor import identity_like as eye_like
 else:
     BACKEND = 'tensorflow'
@@ -22,7 +22,7 @@ else:
     from tensorflow.linalg import tensor_diag as diag
     from tensorflow.linalg import eigh
     from tensorflow.math import reciprocal
-    from tensorflow import where
+    from tensorflow import boolean_mask as nonzero
     import tensorflow as tf
     def eye_like(C):
         return K.eye(K.shape(C)[0])
@@ -43,6 +43,10 @@ class ZCA(Layer):
         assert len(input_shape) >= 2
         input_dim = input_shape[-1]
 
+        dim = input_shape[-1]
+        shape = (dim,)
+        shape = tuple([1]*(len(input_shape)-1)+[input_shape[-1]])
+
         self.C = self.add_weight(shape=(input_dim,input_dim),
                                  initializer=Zeros(),
                                  name='C',
@@ -56,44 +60,35 @@ class ZCA(Layer):
 
     def call(self, X, training=None):
 
-        #X0 = K.transpose( K.dot( self.U, K.transpose(X) ) )
-        X0 = K.dot( X, self.U.transpose )
+        X0 = K.dot( X, self.U )
         if training in {0,False}:
             return X0
-        
+
         nd = K.shape(X)[1]
         n = K.shape(X)[0]
         C = K.dot( K.transpose(X), X ) / K.cast(n-1,'float32')
-        if not self.initialized:
-            self.C = 0.0 * self.C + C
-            self.initialized = True
-        else:
-            self.C = self.momentum * self.C + (1-self.momentum) * C
+        self.C = self.momentum * self.C + (1-self.momentum) * C
 
         C = C + self.r * eye_like(C)
 
         [D,V] = eigh(C)
 
         # Added to increase stability
-        #posInd = tf.where( D > eps )
-#        posInd = where( K.greater(D, eps) )
-        #posInd = K.flatten( K.greater(D, eps) )
-        #posInd = ( K.greater(D, K.cast(eps,'float32')) )
-        #D = D[posInd]
-        #V = V[:, posInd]
-        #D = tf.boolean_mask(D,posInd)
-        #V = tf.boolean_mask(V,posInd,axis=1)
-#        D = tf.gather(D,posInd)
-#        V = tf.gather(V,posInd,axis=1)
-        #V = V.T
+        if BACKEND == 'theano':
+            posInd = K.greater(D, eps).nonzero()[0]
+            D = D[posInd]
+            V = V[:, posInd]
+        else:
+            posBool = K.greater(D,eps)
+            D = tf.boolean_mask( D, posBool )
+            V = tf.boolean_mask( V, posBool, axis=1 )
 
-        #U = K.dot( K.dot( V, diag( reciprocal( K.sqrt( D ) ) ) ), K.transpose(V) )
-        U = K.transpose( K.dot( K.dot( V, diag( reciprocal( K.sqrt( D ) ) ) ), K.transpose(V) ) )
-            
+        U = K.dot( K.dot( V, diag( reciprocal( K.sqrt( D ) ) ) ), K.transpose(V) )
+        U = K.transpose(U)
+
         self.add_update([(self.U,U)],X)
 
-        #X_updated = K.transpose( K.dot( self.U, K.transpose(X) ) )
-        X_updated = K.dot( X, self.U )
+        X_updated = K.dot( X, U )
 
         return K.in_train_phase(X_updated,X0,training=training)
     
@@ -196,16 +191,11 @@ class BatchNorm(Layer):
         if training in {0,False}:
             return X0
 
-        mean = K.mean( inputs, axis=0 )#, keepdims=True )
-        variance = K.var( inputs, axis=0 )#, keepdims=True )
+        mean = K.mean( inputs, axis=0 )
+        variance = K.var( inputs, axis=0 )
 
-        if not self.initialized:
-            mean = 0.0 * self.moving_mean + mean
-            variance = 0.0 * self.moving_variance + variance
-            self.initialized = True
-        else:
-            mean = self.momentum * self.moving_mean + (1-self.momentum) * mean
-            variance = self.momentum * self.moving_variance + (1-self.momentum) * variance
+        mean = self.momentum * self.moving_mean + (1-self.momentum) * mean
+        variance = self.momentum * self.moving_variance + (1-self.momentum) * variance
 
         self.add_update( [(self.moving_mean,mean),(self.moving_variance,variance)], inputs )
 
@@ -256,7 +246,7 @@ def l2dist( X, ncomp=None ):
     diff = H1bar - H2bar
     return K.sum( K.sum( diff**2 ) ) / ( K.cast( K.shape(diff)[0], 'float32') )
 
-def create_model( model_type, nclasses, input_dims, layers, layer_size, shared_size, lr=1e-4, l2dist_weight=1.0, momentum=0.99, l2_weight=0, sd_weight=0, zca_r=1e-4, dropout=False ):
+def create_model( model_type, nclasses, input_dims, layers, layer_size, shared_size, lr=1e-4, l2dist_weight=1.0, momentum=0.99, l2_weight=0, sd_weight=0, zca_r=1e-4, dropout=None ):
     """Create deep TOCCA model."""
 
     if BACKEND == 'tensorflow':

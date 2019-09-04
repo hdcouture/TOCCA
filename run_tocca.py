@@ -12,7 +12,7 @@ from keras.wrappers.scikit_learn import KerasClassifier
 
 import tocca
 
-def train_test_model( X_train, y_train, X_val, y_val, X_test, y_test, model_type, layers, layer_size, l2dist_weight, l2_weight, momentum, learning_rate, batch_size, epochs, sd_weight=0, zca_r=1e-4 ):
+def train_test_model( X_train, y_train, X_val, y_val, X_test, y_test, model_type, layers, layer_size, l2dist_weight, weight_decay, momentum, learning_rate, batch_size, epochs, sd_weight=0, zca_r=1e-4 ):
 
     classes = np.unique(y_train)
     np.sort(classes)
@@ -28,7 +28,7 @@ def train_test_model( X_train, y_train, X_val, y_val, X_test, y_test, model_type
 
     # train model
     input_dims = [ len(Xt[0]) for Xt in X_train ]
-    model = tocca.create_model( model_type, nclasses, input_dims, layers, layer_size, shared_size, learning_rate, l2dist_weight, momentum, l2_weight, sd_weight, zca_r )
+    model = tocca.create_model( model_type, nclasses, input_dims, layers, layer_size, shared_size, learning_rate, l2dist_weight, momentum, weight_decay, sd_weight, zca_r )
     model.fit( X_train, out_train, batch_size=batch_size, epochs=epochs, verbose=2, validation_data=(X_val,out_val), shuffle=True )
 
     p_train = model.predict( X_train )
@@ -59,18 +59,6 @@ def train_test_model( X_train, y_train, X_val, y_val, X_test, y_test, model_type
     shared_test = [ p_test[2][:,:shared_size], p_test[2][:,shared_size:] ]
     p_test = svm.predict( shared_test[1] )
     acc_test = ( y_test == p_test ).mean()
-
-    # sum correlation for train, val, test
-    correlation = lambda X: np.array( [ np.dot( X[0][:,c].T, X[1][:,c] ) / np.sqrt( np.dot( X[0][:,c].T, X[0][:,c] ) * np.dot( X[1][:,c].T, X[1][:,c] ) ) for c in range(X[0].shape[1]) ] ).sum()
-    print('corr',correlation(shared_train),correlation(shared_val),correlation(shared_test))
-
-    ortho = lambda X: [ np.dot( X[:,c1].T, X[:,c2] ) / np.sqrt( np.dot( X[:,c1].T, X[:,c1] ) * np.dot( X[:,c2].T, X[:,c2] ) ) for c1 in range(X.shape[1]) for c2 in range(X.shape[1]) if c1 != c2 ]
-    print(ortho(shared_train[0]))
-    print(ortho(shared_train[1]))
-    #print(ortho(shared_val[0]))
-    #print(ortho(shared_val[1]))
-    #print(ortho(shared_test[0]))
-    #print(ortho(shared_test[1]))
 
     return acc_train,acc_val,acc_test
 
@@ -106,7 +94,7 @@ if __name__ == "__main__":
     shared_size = int(args.shared_size)
     l2dist_weight = args.l2dist
     momentum = args.momentum
-    l2_weight = args.l2
+    weight_decay = args.l2
     sd_weight = args.sd
     zca_r = args.zca
     learning_rate = args.learning_rate
@@ -148,11 +136,11 @@ if __name__ == "__main__":
         layers = [1,2,3,4] if layers is None else [int(layers)]
         layer_size = [200] if layer_size is None else [int(layer_size)]
         l2dist_weight = [1e-3,1e-2,1e-1,1e0,1e1,1e2,1e3] if l2dist_weight is None else [float(l2dist_weight)]
-        l2_weight = [1e-5,1e-4,1e-3,1e-2,1e-1,0] if l2_weight is None else [float(l2_weight)]
+        weight_decay = [1e-5,1e-4,1e-3,1e-2,1e-1,0] if weight_decay is None else [float(weight_decay)]
         momentum = [0.99,0.95,0.9] if momentum is None else [float(momentum)]
         learning_rate = [1e-2,1e-3,1e-4] if learning_rate is None else [float(learning_rate)]
         batch_size = [1000,100] if batch_size is None else [int(batch_size)]
-        params = { 'layers':layers, 'layer_size':layer_size, 'l2dist_weight':l2dist_weight, 'l2_weight':l2_weight, 'momentum':momentum, 'learning_rate':learning_rate, 'batch_size':batch_size }
+        params = { 'layers':layers, 'layer_size':layer_size, 'l2dist_weight':l2dist_weight, 'weight_decay':weight_decay, 'momentum':momentum, 'learning_rate':learning_rate, 'batch_size':batch_size }
         if model_type == 'sd':
             params.update( { 'sd_weight':[1e-5,1e-4,1e-3,1e-2,1e-1] if sd_weight is None else [float(sd_weight)] } )
         elif model_type == 'w':
@@ -162,11 +150,11 @@ if __name__ == "__main__":
         layers = 2 if layers is None else [int(layers)]
         layer_size = [200] if layer_size is None else [int(layer_size)]
         l2dist_weight = [1.0] if l2dist_weight is None else [float(l2dist_weight)]
-        l2_weight = [1e-4] if l2_weight is None else [float(l2_weight)]
+        weight_deca = [1e-4] if weight_decay is None else [float(weight_decay)]
         momentum = [0.99] if momentum is None else [float(momentum)]
         learning_rate = [1e-3] if learning_rate is None else [float(learning_rate)]
         batch_size = [1000] if batch_size is None else [int(batch_size)]
-        params = { 'layers':layers, 'layer_size':layer_size, 'l2dist_weight':l2dist_weight, 'l2_weight':l2_weight, 'momentum':momentum, 'learning_rate':learning_rate, 'batch_size':batch_size }
+        params = { 'layers':layers, 'layer_size':layer_size, 'l2dist_weight':l2dist_weight, 'weight_decay':weight_decay, 'momentum':momentum, 'learning_rate':learning_rate, 'batch_size':batch_size }
         if model_type == 'sd':
             params.update( { 'sd_weight':[0] if sd_weight is None else [float(sd_weight)] } )
         elif model_type == 'w':
@@ -179,9 +167,9 @@ if __name__ == "__main__":
     
     param_sampler = sklearn.model_selection.ParameterSampler( params, param_search )
 
-    X_train_all = X_train
-    y_train_all = y_train
-    X_test_all = X_test
+    X_train_all = X_train[:]
+    y_train_all = y_train[:]
+    X_test_all = X_test[:]
 
     for p in param_sampler:
         print(p)
